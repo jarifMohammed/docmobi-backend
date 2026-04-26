@@ -1,0 +1,322 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Docmobi API Documentation",
+    "version": "1.0.0",
+    "description": "Comprehensive API documentation for the Docmobi backend service. This documentation is centrally managed and covers authentication, user management, appointments, chat, and video calling features."
+  },
+  "servers": [
+    {
+      "url": "/api/v1",
+      "description": "Relative to current host"
+    },
+    {
+      "url": "http://localhost:5000/api/v1",
+      "description": "Local development server"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "schemas": {
+      "User": {
+        "type": "object",
+        "properties": {
+          "_id": { "type": "string" },
+          "fullName": { "type": "string" },
+          "email": { "type": "string" },
+          "role": { "type": "string", "enum": ["patient", "doctor", "admin"] },
+          "avatar": { "type": "object", "properties": { "url": { "type": "string" } } }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "example": false },
+          "message": { "type": "string" }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/auth/register": {
+      "post": {
+        "tags": ["Authentication"],
+        "summary": "Register a new user",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["fullName", "email", "password"],
+                "properties": {
+                  "fullName": { "type": "string" },
+                  "email": { "type": "string", "format": "email" },
+                  "password": { "type": "string" },
+                  "role": { "type": "string", "enum": ["patient", "doctor"] }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "User created successfully" },
+          "400": { "description": "Invalid input" }
+        }
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "tags": ["Authentication"],
+        "summary": "Login to account",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email", "password"],
+                "properties": {
+                  "email": { "type": "string" },
+                  "password": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Login successful" },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    },
+    "/user/profile": {
+      "get": {
+        "tags": ["Users"],
+        "summary": "Get my profile",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Profile data" }
+        }
+      },
+      "put": {
+        "tags": ["Users"],
+        "summary": "Update my profile",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "fullName": { "type": "string" },
+                  "avatar": { "type": "string", "format": "binary" },
+                  "bio": { "type": "string" },
+                  "location": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Profile updated" }
+        }
+      }
+    },
+    "/user/role/doctor/nearby": {
+      "get": {
+        "tags": ["Users"],
+        "summary": "Find doctors near location",
+        "parameters": [
+          { "name": "lat", "in": "query", "schema": { "type": "string" } },
+          { "name": "lng", "in": "query", "schema": { "type": "string" } },
+          { "name": "radiusKm", "in": "query", "schema": { "type": "number", "default": 50 } }
+        ],
+        "responses": {
+          "200": { "description": "List of nearby doctors" }
+        }
+      }
+    },
+    "/appointment": {
+      "get": {
+        "tags": ["Appointments"],
+        "summary": "Get my appointments",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["pending", "accepted", "completed", "cancelled"] } }
+        ],
+        "responses": {
+          "200": { "description": "List of appointments" }
+        }
+      },
+      "post": {
+        "tags": ["Appointments"],
+        "summary": "Book a new appointment",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": ["doctorId", "appointmentType", "date", "time"],
+                "properties": {
+                  "doctorId": { "type": "string" },
+                  "appointmentType": { "type": "string", "enum": ["physical", "video"] },
+                  "date": { "type": "string", "format": "date" },
+                  "time": { "type": "string" },
+                  "symptoms": { "type": "string" },
+                  "medicalDocuments": { "type": "array", "items": { "type": "string", "format": "binary" } },
+                  "paymentScreenshot": { "type": "string", "format": "binary" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Appointment request submitted" }
+        }
+      }
+    },
+    "/appointment/{appointmentId}/confirm": {
+      "patch": {
+        "tags": ["Appointments"],
+        "summary": "Confirm appointment status",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "appointmentId", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "status": { "type": "string", "enum": ["accepted", "rejected"] }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Status updated" }
+        }
+      }
+    },
+    "/chat": {
+      "get": {
+        "tags": ["Chat"],
+        "summary": "Get my conversations",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "List of chats" }
+        }
+      },
+      "post": {
+        "tags": ["Chat"],
+        "summary": "Start or get a 1-1 chat",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["participantId"],
+                "properties": {
+                  "participantId": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Chat details" }
+        }
+      }
+    },
+    "/chat/{chatId}/messages": {
+      "get": {
+        "tags": ["Chat"],
+        "summary": "Get messages in a chat",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "chatId", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "List of messages" }
+        }
+      },
+      "post": {
+        "tags": ["Chat"],
+        "summary": "Send a message",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "chatId", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": ["content"],
+                "properties": {
+                  "content": { "type": "string" },
+                  "files": { "type": "array", "items": { "type": "string", "format": "binary" } }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Message sent" }
+        }
+      }
+    },
+    "/call/initiate": {
+      "post": {
+        "tags": ["Calls"],
+        "summary": "Initiate a video/audio call",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["toUserId", "chatId"],
+                "properties": {
+                  "toUserId": { "type": "string" },
+                  "chatId": { "type": "string" },
+                  "isVideo": { "type": "boolean", "default": true }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Call initiated" }
+        }
+      }
+    },
+    "/call/token": {
+      "get": {
+        "tags": ["Calls"],
+        "summary": "Get Agora RTC token",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "channelName", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "role", "in": "query", "schema": { "type": "string", "enum": ["publisher", "subscriber"], "default": "publisher" } }
+        ],
+        "responses": {
+          "200": { "description": "Token data" }
+        }
+      }
+    }
+  }
+}
