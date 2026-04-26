@@ -111,164 +111,111 @@ export const confirmAppointment = catchAsync(async (req, res) => {
   });
 });
 
-export const createAppointment = catchAsync(async (req, res) => {
-  const {
-    doctorId,
-    appointmentType, // "physical" | "videooo"
-    date, // "2025-12-04"
-    time, // "10:30"
-    symptoms,
-    bookedFor,
-  } = req.body;
+/**
+ * Helper to resolve the bookedFor payload (self or dependent)
+ */
+const resolveBookedFor = (patient, bookedForRaw) => {
+  const bookedForInput = (typeof bookedForRaw === "string" ? JSON.parse(bookedForRaw) : bookedForRaw) || {};
+  const typeRaw = String(bookedForInput?.type || "").trim().toLowerCase();
 
-  const patientId = req.user?._id;
-
-  // 1) validate doctor & patient
-  const doctor = await User.findById(doctorId);
-  if (!doctor || doctor.role !== "doctor") {
-    throw new AppError(httpStatus.NOT_FOUND, "Doctor not found");
-  }
-
-  const patient = await User.findById(patientId);
-  if (!patient) {
-    throw new AppError(httpStatus.NOT_FOUND, "Patient not found");
-  }
-
-  const bookedForInput = parseJSONMaybe(bookedFor) || {};
-  const typeRaw = String(bookedForInput?.type || "")
-    .trim()
-    .toLowerCase();
-
+  // 1. Resolve Scope
   let bookingScope = "self";
-
-  if (!typeRaw) {
-    bookingScope = "self";
-  } else if (["self", "me", "myself"].includes(typeRaw)) {
-    bookingScope = "self";
-  } else if (["dependent", "dependant", "child"].includes(typeRaw)) {
+  if (["dependent", "dependant", "child"].includes(typeRaw)) {
     bookingScope = "dependent";
-  } else {
-    throw new AppError(
-      httpStatus.BAD_REQUEST,
-      "bookedFor.type must be 'self' or 'dependent'",
-    );
+  } else if (typeRaw && !["self", "me", "myself", ""].includes(typeRaw)) {
+    throw new AppError(httpStatus.BAD_REQUEST, "bookedFor.type must be 'self' or 'dependent'");
   }
 
-  const patientNameSnapshot = String(patient.fullName || "").trim();
-  let bookedForPayload =
-    bookingScope === "self"
-      ? { type: "self", nameSnapshot: patientNameSnapshot }
-      : null;
-
-  if (bookingScope === "dependent") {
-    const dependentId =
-      bookedForInput?.dependentId || bookedForInput?._id || bookedForInput?.id;
-
-    if (!dependentId || !mongoose.Types.ObjectId.isValid(dependentId)) {
-      throw new AppError(
-        httpStatus.BAD_REQUEST,
-        "A valid dependentId is required when booking for a dependent",
-      );
-    }
-
-    const dependent =
-      (patient.dependents || []).find(
-        (dep) => String(dep._id) === String(dependentId),
-      ) || null;
-
-    if (!dependent) {
-      throw new AppError(
-        httpStatus.BAD_REQUEST,
-        "Dependent not found for the current user",
-      );
-    }
-
-    if (dependent.isActive === false) {
-      throw new AppError(
-        httpStatus.BAD_REQUEST,
-        "Dependent is inactive and cannot be used for booking",
-      );
-    }
-
-    bookedForPayload = {
-      type: "dependent",
-      dependentId: dependent._id,
-      nameSnapshot: String(dependent.fullName || "").trim(),
-    };
+  // 2. Self Booking
+  if (bookingScope === "self") {
+    return { type: "self", nameSnapshot: String(patient.fullName || "").trim() };
   }
 
-  // 2) validate type
-  const type = normalizeAppointmentType(appointmentType);
-  if (!type) {
-    throw new AppError(
-      httpStatus.BAD_REQUEST,
-      "appointmentType must be physical or video",
-    );
+  // 3. Dependent Booking
+  const dependentId = bookedForInput?.dependentId || bookedForInput?._id || bookedForInput?.id;
+  if (!dependentId || !mongoose.Types.ObjectId.isValid(dependentId)) {
+    throw new AppError(httpStatus.BAD_REQUEST, "A valid dependentId is required for dependent bookings");
   }
 
-  // 3) validate date
-  const appointmentDate = parseDate(date);
-  if (!appointmentDate) {
-    throw new AppError(httpStatus.BAD_REQUEST, "Invalid date format");
+  const dependent = (patient.dependents || []).find((dep) => String(dep._id) === String(dependentId));
+  if (!dependent) {
+    throw new AppError(httpStatus.BAD_REQUEST, "Dependent not found for the current user");
   }
 
-  // 4) validate time
-  if (!timeRegex.test(time || "")) {
-    throw new AppError(
-      httpStatus.BAD_REQUEST,
-      "time must be HH:MM in 24-hour format (e.g. 10:30)",
-    );
+  if (dependent.isActive === false) {
+    throw new AppError(httpStatus.BAD_REQUEST, "Dependent is inactive");
   }
 
-  // 5) upload files
-  const medicalDocsFiles = req.files?.medicalDocuments || [];
-  const paymentFiles = req.files?.paymentScreenshot || [];
+  return {
+    type: "dependent",
+    dependentId: dependent._id,
+    nameSnapshot: String(dependent.fullName || "").trim(),
+  };
+};
 
-  const medicalDocuments = [];
-  for (const file of medicalDocsFiles) {
-    const up = await uploadOnCloudinary(file.buffer, {
-      folder: "docmobi/appointments/medicalDocs",
-      resource_type: "image",
-    });
-    medicalDocuments.push({ public_id: up.public_id, url: up.secure_url });
-  }
+/**
+ * Helper to upload appointment files in parallel
+ */
+const uploadAppointmentFiles = async (files, type) => {
+  const medicalDocsFiles = files?.medicalDocuments || [];
+  const paymentFiles = files?.paymentScreenshot || [];
 
-  let paymentScreenshot = undefined;
-  if (paymentFiles[0]) {
-    const up = await uploadOnCloudinary(paymentFiles[0].buffer, {
-      folder: "docmobi/appointments/payment",
-      resource_type: "image",
-    });
-    paymentScreenshot = { public_id: up.public_id, url: up.secure_url };
-  }
+  // Parallelize all uploads
+  const [medicalDocsResults, paymentResults] = await Promise.all([
+    Promise.all(medicalDocsFiles.map(file => uploadOnCloudinary(file.buffer, { folder: "docmobi/appointments/medicalDocs", resource_type: "image" }))),
+    Promise.all(paymentFiles.map(file => uploadOnCloudinary(file.buffer, { folder: "docmobi/appointments/payment", resource_type: "image" })))
+  ]);
+
+  const medicalDocuments = medicalDocsResults.map(up => ({ public_id: up.public_id, url: up.secure_url }));
+  const paymentScreenshot = paymentResults[0] ? { public_id: paymentResults[0].public_id, url: paymentResults[0].secure_url } : null;
 
   if (type === "video" && !paymentScreenshot) {
-    throw new AppError(
-      httpStatus.BAD_REQUEST,
-      "Payment screenshot is required for video appointments",
-    );
+    throw new AppError(httpStatus.BAD_REQUEST, "Payment screenshot is required for video appointments");
   }
 
-  // 6) conflict check: same doctor, date & time
+  return { medicalDocuments, paymentScreenshot };
+};
+
+export const createAppointment = catchAsync(async (req, res) => {
+  const { doctorId, appointmentType, date, time, symptoms, bookedFor } = req.body;
+  const patientId = req.user?._id;
+
+  // 1) Validate Users
+  const doctor = await User.findById(doctorId);
+  if (doctor?.role !== "doctor") throw new AppError(httpStatus.NOT_FOUND, "Doctor not found");
+
+  const patient = await User.findById(patientId);
+  if (!patient) throw new AppError(httpStatus.NOT_FOUND, "Patient not found");
+
+  // 2) Resolve booking target and validation
+  const bookedForPayload = resolveBookedFor(patient, bookedFor);
+  const type = normalizeAppointmentType(appointmentType);
+  if (!type) throw new AppError(httpStatus.BAD_REQUEST, "Invalid appointmentType");
+
+  const appointmentDate = parseDate(date);
+  if (!appointmentDate) throw new AppError(httpStatus.BAD_REQUEST, "Invalid date format");
+
+  if (!timeRegex.test(time || "")) {
+    throw new AppError(httpStatus.BAD_REQUEST, "Time must be HH:MM in 24-hour format");
+  }
+
+  // 3) Concurrent File Uploads (Performance Gain 🚀)
+  const { medicalDocuments, paymentScreenshot } = await uploadAppointmentFiles(req.files, type);
+
+  // 4) Conflict Check
   const conflict = await Appointment.findOne({
     doctor: doctorId,
     appointmentDate,
     time,
     status: { $in: ["pending", "accepted"] },
   });
+  if (conflict) throw new AppError(httpStatus.CONFLICT, "This time slot is already booked");
 
-  if (conflict) {
-    throw new AppError(
-      httpStatus.CONFLICT,
-      "This time slot is already booked for this doctor",
-    );
-  }
-
-  // 7) create appointment with proper bookedFor
+  // 5) Create Appointment
   const appointment = await Appointment.create({
     doctor: doctorId,
     patient: patientId,
-    bookedFor: bookedForPayload, // ✅ Now includes relationship
+    bookedFor: bookedForPayload,
     appointmentType: type,
     appointmentDate,
     time,
@@ -277,7 +224,7 @@ export const createAppointment = catchAsync(async (req, res) => {
     paymentScreenshot,
   });
 
-  // 🔔 Notification – patient booked appointment → notify doctor
+  // 6) Notifications
   const notificationPayload = {
     userId: doctor._id,
     fromUserId: patient._id,
@@ -296,16 +243,16 @@ export const createAppointment = catchAsync(async (req, res) => {
   };
 
   await createNotification(notificationPayload);
-  // Emit socket event
   io.to(doctor._id.toString()).emit("appointment_booked", notificationPayload);
 
   sendResponse(res, {
     statusCode: httpStatus.CREATED,
     success: true,
-    message: "Appointment request submitted",
+    message: "Appointment created successfully",
     data: appointment,
   });
 });
+
 export const getAvailableAppointments = catchAsync(async (req, res) => {
   const { doctorId, date } = req.body;
 
@@ -317,7 +264,7 @@ export const getAvailableAppointments = catchAsync(async (req, res) => {
   }
 
   const doctor = await User.findById(doctorId).select("role weeklySchedule");
-  if (!doctor || doctor.role !== "doctor") {
+  if (doctor?.role !== "doctor") {
     throw new AppError(httpStatus.NOT_FOUND, "Doctor not found");
   }
 
@@ -342,7 +289,7 @@ export const getAvailableAppointments = catchAsync(async (req, res) => {
     (d) => d.day === dayName && d.isActive,
   );
 
-  if (!daySchedule || !daySchedule.slots?.length) {
+  if (!daySchedule?.slots?.length) {
     return sendResponse(res, {
       statusCode: httpStatus.OK,
       success: true,
@@ -467,28 +414,30 @@ export const getMyAppointments = catchAsync(async (req, res) => {
   const total = countResult[0]?.total || 0;
 
   // 🔹 Sort + pagination
-  pipeline.push({ $sort: { ...sort, appointmentDate: 1, time: 1 } });
-  pipeline.push({ $skip: skip });
-  pipeline.push({ $limit: pageLimit });
-
-  // 🔹 Project fields
-  pipeline.push({
-    $project: {
-      doctor: { _id: 1, fullName: 1, role: 1, specialty: 1, avatar: 1, fees: 1 },
-      patient: { _id: 1, fullName: 1, role: 1, avatar: 1, dependents: 1 },
-      appointmentDate: 1,
-      time: 1,
-      status: 1,
-      bookedFor: 1,
-      appointmentType: 1,
-      createdAt: 1,
-      symptoms: 1,
-      medicalDocuments: 1,
-      paymentScreenshot: 1,
-      notes: 1,
-      reason: 1,
+  pipeline.push(
+    { $sort: { ...sort, appointmentDate: 1, time: 1 } },
+    { $skip: skip },
+    { $limit: pageLimit },
+    {
+      $project: {
+        doctor: { _id: 1, fullName: 1, role: 1, specialty: 1, avatar: 1, fees: 1 },
+        patient: { _id: 1, fullName: 1, role: 1, avatar: 1, dependents: 1 },
+        appointmentDate: 1,
+        time: 1,
+        status: 1,
+        bookedFor: 1,
+        appointmentType: 1,
+        createdAt: 1,
+        symptoms: 1,
+        medicalDocuments: 1,
+        paymentScreenshot: 1,
+        notes: 1,
+        reason: 1,
+      },
     },
-  });
+  );
+
+
 
   // 🔹 Fetch paginated appointments
   let appointments = await Appointment.aggregate(pipeline);
@@ -543,237 +492,140 @@ export const getMyAppointments = catchAsync(async (req, res) => {
 
 
 
-export const updateAppointment = catchAsync(async (req, res) => {
-  const { id } = req.params;
-  const { appointmentType, date, time, symptoms, bookedFor } = req.body;
-
-  const userId = req.user._id;
-  const role = req.user.role;
-
-  const appointment = await Appointment.findById(id);
-  if (!appointment) {
-    throw new AppError(httpStatus.NOT_FOUND, "Appointment not found");
-  }
-
-  const isPatientOwner =
-    role === "patient" && String(appointment.patient) === String(userId);
-  const isDoctorOwner =
-    role === "doctor" && String(appointment.doctor) === String(userId);
+/**
+ * Helper to verify if a user has permission to update an appointment
+ */
+const verifyUpdatePermissions = (appointment, user) => {
+  const { _id: userId, role } = user;
+  const isPatientOwner = role === "patient" && String(appointment.patient) === String(userId);
+  const isDoctorOwner = role === "doctor" && String(appointment.doctor) === String(userId);
   const isAdmin = role === "admin";
 
   if (!isPatientOwner && !isDoctorOwner && !isAdmin) {
-    throw new AppError(
-      httpStatus.FORBIDDEN,
-      "You are not allowed to update this appointment",
-    );
+    throw new AppError(httpStatus.FORBIDDEN, "Unauthorized to update this appointment");
   }
 
   if (["completed", "cancelled"].includes(appointment.status)) {
-    throw new AppError(
-      httpStatus.BAD_REQUEST,
-      "Completed or cancelled appointments cannot be updated",
-    );
+    throw new AppError(httpStatus.BAD_REQUEST, "Finished appointments cannot be updated");
   }
 
-  const updates = {};
+  return { isPatientOwner };
+};
 
-  if (appointmentType !== undefined) {
-    const type = normalizeAppointmentType(appointmentType);
-    if (!type) {
-      throw new AppError(
-        httpStatus.BAD_REQUEST,
-        "appointmentType must be physical or video",
-      );
-    }
-    updates.appointmentType = type;
-  }
-
-  if (date !== undefined) {
-    const appointmentDate = parseDate(date);
-    if (!appointmentDate) {
-      throw new AppError(httpStatus.BAD_REQUEST, "Invalid date format");
-    }
-    updates.appointmentDate = appointmentDate;
-  }
-
-  if (time !== undefined) {
-    if (!timeRegex.test(time || "")) {
-      throw new AppError(
-        httpStatus.BAD_REQUEST,
-        "time must be HH:MM in 24-hour format (e.g. 10:30)",
-      );
-    }
-    updates.time = time;
-  }
-
-  if (symptoms !== undefined) {
-    updates.symptoms = String(symptoms);
-  }
-
-  if (bookedFor !== undefined) {
-    if (!isPatientOwner) {
-      throw new AppError(
-        httpStatus.FORBIDDEN,
-        "Only the patient can update bookedFor details",
-      );
-    }
-    updates.bookedFor = buildBookedForPayload(bookedFor, req.user);
-  }
-
-  const medicalDocsFiles = req.files?.medicalDocuments || [];
-  const paymentFiles = req.files?.paymentScreenshot || [];
+/**
+ * Helper to process file updates during appointment modification
+ */
+const handleUpdateFiles = async (reqFiles, appointment, updates) => {
+  const medicalDocsFiles = reqFiles?.medicalDocuments || [];
+  const paymentFiles = reqFiles?.paymentScreenshot || [];
+  const fileOperations = [];
 
   if (medicalDocsFiles.length > 0) {
-    for (const doc of appointment.medicalDocuments || []) {
-      if (doc?.public_id) {
-        await deleteFromCloudinary(doc.public_id).catch(() => { });
-      }
-    }
-
-    const medicalDocuments = [];
-    for (const file of medicalDocsFiles) {
-      const up = await uploadOnCloudinary(file.buffer, {
-        folder: "docmobi/appointments/medicalDocs",
-        resource_type: "image",
-      });
-      medicalDocuments.push({ public_id: up.public_id, url: up.secure_url });
-    }
-    updates.medicalDocuments = medicalDocuments;
+    (appointment.medicalDocuments || []).forEach(doc => {
+      if (doc?.public_id) fileOperations.push(deleteFromCloudinary(doc.public_id).catch(() => { }));
+    });
+    fileOperations.push(
+      Promise.all(medicalDocsFiles.map(file =>
+        uploadOnCloudinary(file.buffer, { folder: "docmobi/appointments/medicalDocs", resource_type: "image" })
+      )).then(results => {
+        updates.medicalDocuments = results.map(up => ({ public_id: up.public_id, url: up.secure_url }));
+      })
+    );
   }
 
   if (paymentFiles[0]) {
     if (appointment.paymentScreenshot?.public_id) {
-      await deleteFromCloudinary(appointment.paymentScreenshot.public_id).catch(
-        () => { },
-      );
+      fileOperations.push(deleteFromCloudinary(appointment.paymentScreenshot.public_id).catch(() => { }));
     }
-
-    const up = await uploadOnCloudinary(paymentFiles[0].buffer, {
-      folder: "docmobi/appointments/payment",
-      resource_type: "image",
-    });
-    updates.paymentScreenshot = { public_id: up.public_id, url: up.secure_url };
-  }
-
-  const finalType = updates.appointmentType || appointment.appointmentType;
-  const finalDate = updates.appointmentDate || appointment.appointmentDate;
-  const finalTime = updates.time || appointment.time;
-
-  if (
-    finalType === "video" &&
-    !updates.paymentScreenshot &&
-    !appointment.paymentScreenshot?.url
-  ) {
-    throw new AppError(
-      httpStatus.BAD_REQUEST,
-      "Payment screenshot is required for video appointments",
+    fileOperations.push(
+      uploadOnCloudinary(paymentFiles[0].buffer, { folder: "docmobi/appointments/payment", resource_type: "image" })
+        .then(up => { updates.paymentScreenshot = { public_id: up.public_id, url: up.secure_url }; })
     );
   }
 
-  const scheduleChanged =
-    (updates.appointmentDate &&
-      new Date(updates.appointmentDate).getTime() !==
-      new Date(appointment.appointmentDate).getTime()) ||
+  if (fileOperations.length > 0) await Promise.all(fileOperations);
+};
+
+/**
+ * Helper to collect and validate update fields for an appointment
+ */
+const getAppointmentUpdateFields = async (body, isPatientOwner, currentUserId) => {
+  const { appointmentType, date, time, symptoms, bookedFor } = body;
+  const updates = {};
+
+  if (symptoms !== undefined) updates.symptoms = String(symptoms);
+
+  if (appointmentType !== undefined) {
+    updates.appointmentType = normalizeAppointmentType(appointmentType);
+    if (!updates.appointmentType) throw new AppError(httpStatus.BAD_REQUEST, "Invalid type");
+  }
+
+  if (date !== undefined) {
+    updates.appointmentDate = parseDate(date);
+    if (!updates.appointmentDate) throw new AppError(httpStatus.BAD_REQUEST, "Invalid date");
+  }
+
+  if (time !== undefined) {
+    if (!timeRegex.test(time || "")) throw new AppError(httpStatus.BAD_REQUEST, "Invalid time");
+    updates.time = time;
+  }
+
+  if (bookedFor !== undefined) {
+    if (!isPatientOwner) throw new AppError(httpStatus.FORBIDDEN, "Only the patient can update bookedFor");
+    const patient = await User.findById(currentUserId);
+    updates.bookedFor = resolveBookedFor(patient, bookedFor);
+  }
+
+  return updates;
+};
+
+export const updateAppointment = catchAsync(async (req, res) => {
+  const { id } = req.params;
+  const appointment = await Appointment.findById(id);
+  if (!appointment) throw new AppError(httpStatus.NOT_FOUND, "Appointment not found");
+
+  // 1) Permissions
+  const { isPatientOwner } = verifyUpdatePermissions(appointment, req.user);
+
+  // 2) Collect Updates
+  const updates = await getAppointmentUpdateFields(req.body, isPatientOwner, req.user._id);
+
+  // 3) Handle Files (Parallel 🚀)
+  await handleUpdateFiles(req.files, appointment, updates);
+
+  // 4) Final Validation & Conflict Check
+  const finalType = updates.appointmentType || appointment.appointmentType;
+  if (finalType === "video" && !updates.paymentScreenshot && !appointment.paymentScreenshot?.url) {
+    throw new AppError(httpStatus.BAD_REQUEST, "Payment screenshot required for video");
+  }
+
+  const finalDate = updates.appointmentDate || appointment.appointmentDate;
+  const finalTime = updates.time || appointment.time;
+  const scheduleChanged = (updates.appointmentDate && new Date(updates.appointmentDate).getTime() !== new Date(appointment.appointmentDate).getTime()) ||
     (updates.time && updates.time !== appointment.time);
 
   if (scheduleChanged) {
-    const conflict = await Appointment.findOne({
-      doctor: appointment.doctor,
-      appointmentDate: finalDate,
-      time: finalTime,
-      status: { $in: ["pending", "accepted"] },
-      _id: { $ne: appointment._id },
-    });
-
-    if (conflict) {
-      throw new AppError(
-        httpStatus.CONFLICT,
-        "This time slot is already booked for this doctor",
-      );
-    }
+    const conflict = await Appointment.findOne({ doctor: appointment.doctor, appointmentDate: finalDate, time: finalTime, status: { $in: ["pending", "accepted"] }, _id: { $ne: appointment._id } });
+    if (conflict) throw new AppError(httpStatus.CONFLICT, "Time slot already booked");
   }
 
-  if (Object.keys(updates).length === 0) {
-    throw new AppError(httpStatus.BAD_REQUEST, "No fields to update");
-  }
+  if (Object.keys(updates).length === 0) throw new AppError(httpStatus.BAD_REQUEST, "No changes provided");
 
   appointment.set(updates);
   await appointment.save();
+  await appointment.populate([{ path: "doctor", select: "fullName role specialty avatar fees" }, { path: "patient", select: "fullName role avatar" }]);
 
-  await appointment.populate([
-    { path: "doctor", select: "fullName role specialty avatar fees" },
-    { path: "patient", select: "fullName role avatar" },
-  ]);
-
-  sendResponse(res, {
-    statusCode: httpStatus.OK,
-    success: true,
-    message: "Appointment updated successfully",
-    data: appointment,
-  });
+  sendResponse(res, { statusCode: httpStatus.OK, success: true, message: "Appointment updated", data: appointment });
 });
 
+
+
+
 //  FIXED: updateAppointmentStatus - Now allows patient to cancel
-export const updateAppointmentStatus = catchAsync(async (req, res) => {
-  const { id } = req.params;
-  const { status, patient, price } = req.body;
-  const userId = req.user._id;
-  const role = req.user.role;
-
-  const allowedStatuses = ["pending", "accepted", "completed", "cancelled"];
-
-  if (!status || !allowedStatuses.includes(status)) {
-    throw new AppError(
-      httpStatus.BAD_REQUEST,
-      "Status must be one of: pending, accepted, completed, cancelled",
-    );
-  }
-
-  const appointment = await Appointment.findById(id)
-    .populate("doctor", "fullName fees role")
-    .populate("patient", "fullName role");
-
-  if (!appointment) {
-    throw new AppError(httpStatus.NOT_FOUND, "Appointment not found");
-  }
-
-  const isDoctorOwner =
-    role === "doctor" && String(appointment.doctor?._id) === String(userId);
-
-  const isPatientOwner =
-    role === "patient" && String(appointment.patient?._id) === String(userId);
-
-  const isAdmin = role === "admin";
-
-  // ✅ NEW: Permission logic with patient support
-  const canUpdate = isDoctorOwner || isAdmin || isPatientOwner;
-
-  if (!canUpdate) {
-    throw new AppError(
-      httpStatus.FORBIDDEN,
-      "You don't have permission to update this appointment",
-    );
-  }
-
-  // ✅ NEW: Patient can only cancel their own appointments
-  if (role === "patient" && status !== "cancelled") {
-    throw new AppError(
-      httpStatus.FORBIDDEN,
-      "Patients can only cancel appointments. Other status changes require doctor approval.",
-    );
-  }
-
-  // ✅ NEW: Check if patient is trying to cancel someone else's appointment
-  if (role === "patient" && status === "cancelled") {
-    if (String(appointment.patient?._id) !== String(userId)) {
-      throw new AppError(
-        httpStatus.FORBIDDEN,
-        "You can only cancel your own appointments",
-      );
-    }
-  }
-
-  const current = appointment.status;
+/**
+ * Helper to validate status transitions
+ */
+const validateStatusTransition = (current, next) => {
   const transitions = {
     pending: ["accepted", "cancelled"],
     accepted: ["completed", "cancelled"],
@@ -781,159 +633,133 @@ export const updateAppointmentStatus = catchAsync(async (req, res) => {
     cancelled: [],
   };
 
-  if (!transitions[current].includes(status) && current !== status) {
-    throw new AppError(
-      httpStatus.BAD_REQUEST,
-      `Invalid status transition from ${current} to ${status}`,
-    );
+  if (current !== next && !transitions[current]?.includes(next)) {
+    throw new AppError(httpStatus.BAD_REQUEST, `Invalid status transition from ${current} to ${next}`);
+  }
+};
+
+/**
+ * Helper to handle completion-specific logic (pricing, commissions)
+ */
+const handleCompletionLogic = (appointment, { patientName, price, role }) => {
+  if (role === "patient") throw new AppError(httpStatus.FORBIDDEN, "Only doctors can complete appointments");
+
+  if (!patientName || String(patientName).trim() !== appointment.patient?.fullName) {
+    throw new AppError(httpStatus.BAD_REQUEST, "Patient name mismatch or missing");
   }
 
-  // ✅ Validation for "completed" status (only doctor/admin)
-  if (status === "completed") {
-    if (role === "patient") {
-      throw new AppError(
-        httpStatus.FORBIDDEN,
-        "Only doctors can mark appointments as completed",
-      );
-    }
-
-    if (!patient || !String(patient).trim()) {
-      throw new AppError(
-        httpStatus.BAD_REQUEST,
-        "patient (fullName) is required when completing appointment",
-      );
-    }
-
-    const dbPatientName = appointment.patient?.fullName || "";
-    if (String(patient).trim() !== dbPatientName) {
-      throw new AppError(
-        httpStatus.BAD_REQUEST,
-        "Patient name does not match appointment patient",
-      );
-    }
-
-    if (price === undefined || price === null || String(price).trim() === "") {
-      throw new AppError(
-        httpStatus.BAD_REQUEST,
-        "price is required when completing appointment",
-      );
-    }
-
-    const paidAmount = Number(price);
-    if (!Number.isFinite(paidAmount) || paidAmount < 0) {
-      throw new AppError(
-        httpStatus.BAD_REQUEST,
-        "price must be a valid positive number",
-      );
-    }
-
-    const doctorFee = Number(appointment.doctor?.fees?.amount || 0);
-    if (paidAmount < doctorFee) {
-      throw new AppError(
-        httpStatus.BAD_REQUEST,
-        "Paid amount is less than the doctor's fees",
-      );
-    }
-
-    // ✅ Set commission: 20 for physical, 40 for video
-    appointment.adminEarning = appointment.appointmentType === "video" ? 40 : 20;
-
-    appointment.paymentVerified = true;
-    appointment.paidAmount = paidAmount;
+  const paidAmount = Number(price);
+  if (!Number.isFinite(paidAmount) || paidAmount < (appointment.doctor?.fees?.amount || 0)) {
+    throw new AppError(httpStatus.BAD_REQUEST, "Invalid or insufficient paid amount");
   }
 
-  appointment.status = status;
-  await appointment.save();
+  appointment.adminEarning = appointment.appointmentType === "video" ? 40 : 20;
+  appointment.paymentVerified = true;
+  appointment.paidAmount = paidAmount;
+};
 
+/**
+ * Helper to dispatch notifications based on status changes
+ */
+const dispatchStatusNotifications = async (appointment, status, role, actorId) => {
   const patientId = appointment.patient._id;
   const doctorId = appointment.doctor._id;
   const doctorName = appointment.doctor.fullName;
   const patientName = appointment.patient.fullName;
 
-  // ✅ Send notification based on who made the change
-  let content = "";
-  let notifyUserId = null;
-  let fromUserId = userId;
+  let notifyUserId, content, type, title;
 
-  if (status === "cancelled") {
-    if (role === "patient") {
-      // Patient cancelled - notify doctor
-      content = `${patientName} has cancelled their appointment.`;
-      notifyUserId = doctorId;
-    } else {
-      // Doctor/admin cancelled - notify patient
-      content = `Your appointment with ${doctorName} has been cancelled.`;
+  switch (status) {
+    case "accepted":
       notifyUserId = patientId;
-    }
-  } else if (status === "accepted") {
-    content = `${doctorName} has accepted your appointment request.`;
-    notifyUserId = patientId;
-  } else if (status === "completed") {
-    content = `Your appointment with ${doctorName} has been completed.`;
-    notifyUserId = patientId;
+      content = `${doctorName} has accepted your appointment request.`;
+      type = "appointment_confirmed";
+      title = "Appointment Confirmed! 🎉";
+      break;
+    case "completed":
+      notifyUserId = patientId;
+      content = `Your appointment with ${doctorName} has been completed.`;
+      type = "appointment_completed";
+      title = "Appointment Completed";
+      break;
+    case "cancelled":
+      notifyUserId = role === "patient" ? doctorId : patientId;
+      content = role === "patient" ? `${patientName} has cancelled their appointment.` : `Your appointment with ${doctorName} has been cancelled.`;
+      type = "appointment_cancelled";
+      title = "Appointment Cancelled";
+      break;
+    default:
+      return;
   }
 
-  if (notifyUserId) {
-    // Determine notification type for FCM
-    let notificationType = "appointment_status_change";
-    let notificationTitle = "Appointment status updated";
+  const payload = {
+    userId: notifyUserId,
+    fromUserId: actorId,
+    type,
+    title,
+    content,
+    appointmentId: appointment._id,
+    meta: { status, doctorName, patientName, updatedBy: role },
+    sendPush: true,
+  };
 
-    if (status === "accepted") {
-      notificationType = "appointment_confirmed";
-      notificationTitle = "Appointment Confirmed! 🎉";
-    } else if (status === "cancelled") {
-      notificationType = "appointment_cancelled";
-      notificationTitle = "Appointment Cancelled";
-    } else if (status === "completed") {
-      notificationType = "appointment_completed";
-      notificationTitle = "Appointment Completed";
-    }
+  await createNotification(payload);
+  io.to(notifyUserId.toString()).emit(type, payload);
+};
 
-    const notificationPayload = {
-      userId: notifyUserId,
-      fromUserId,
-      type: notificationType,
-      title: notificationTitle,
-      content,
-      appointmentId: appointment._id,
-      meta: {
-        status,
-        price,
-        doctorId,
-        doctorName,
-        patientName,
-        updatedBy: role,
-      },
-      sendPush: true, // Enable FCM push notification
-    };
+export const updateAppointmentStatus = catchAsync(async (req, res) => {
+  const { id } = req.params;
+  const { status, patient: inputPatientName, price } = req.body;
+  const { _id: userId, role } = req.user;
 
-    await createNotification(notificationPayload);
-    // Emit socket event
-    io.to(notifyUserId.toString()).emit(notificationType, notificationPayload);
+  const appointment = await Appointment.findById(id)
+    .populate("doctor", "fullName fees role")
+    .populate("patient", "fullName role");
+
+  if (!appointment) throw new AppError(httpStatus.NOT_FOUND, "Appointment not found");
+
+  // 1) Permissions
+  const isDoctorOwner = role === "doctor" && String(appointment.doctor?._id) === String(userId);
+  const isPatientOwner = role === "patient" && String(appointment.patient?._id) === String(userId);
+  const isAdmin = role === "admin";
+
+  if (!isDoctorOwner && !isPatientOwner && !isAdmin) {
+    throw new AppError(httpStatus.FORBIDDEN, "Unauthorized status update");
   }
 
-  let sessionInfo = null;
+  // 2) Role-Specific Restrictions
+  if (role === "patient" && status !== "cancelled") {
+    throw new AppError(httpStatus.FORBIDDEN, "Patients can only cancel appointments");
+  }
 
+  // 3) State Machine Validation
+  validateStatusTransition(appointment.status, status);
+
+  // 4) Logic for "completed"
   if (status === "completed") {
-    const { amount = 0, currency = "USD" } = appointment.doctor?.fees || {};
-
-    sessionInfo = {
-      sessionHolderName: patientName,
-      payableAmount: amount,
-      currency,
-    };
+    handleCompletionLogic(appointment, { patientName: inputPatientName, price, role });
   }
+
+  // 5) Save & Notify
+  appointment.status = status;
+  await appointment.save();
+  await dispatchStatusNotifications(appointment, status, role, userId);
+
+  // 6) Build Response
+  const sessionInfo = status === "completed" ? {
+    sessionHolderName: appointment.patient.fullName,
+    payableAmount: appointment.doctor?.fees?.amount || 0,
+    currency: appointment.doctor?.fees?.currency || "USD",
+  } : null;
 
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
     message: "Appointment status updated",
-    data: {
-      appointment,
-      sessionInfo,
-    },
+    data: { appointment, sessionInfo },
   });
 });
+
 
 export const deleteAppointment = catchAsync(async (req, res) => {
   const { id } = req.params;
@@ -1010,164 +836,106 @@ const getDateRangeForView = (view) => {
   return { start, end };
 };
 
+/**
+ * Helper to calculate doctor-specific earnings
+ */
+const calculateDoctorEarnings = (appointments, view) => {
+  let totalEarnings = 0, physicalEarnings = 0, videoEarnings = 0, physicalCount = 0, videoCount = 0;
+  const weeklyByWeekday = [0, 0, 0, 0, 0, 0, 0];
+
+  for (const appt of appointments) {
+    const fee = Number(appt.doctor?.fees?.amount || 0);
+    totalEarnings += fee;
+
+    if (appt.appointmentType === "physical") {
+      physicalEarnings += fee;
+      physicalCount++;
+    } else {
+      videoEarnings += fee;
+      videoCount++;
+    }
+
+    if (view === "weekly" && appt.appointmentDate) {
+      weeklyByWeekday[new Date(appt.appointmentDate).getDay()] += fee;
+    }
+  }
+
+  return {
+    scope: "doctor",
+    view,
+    totalEarnings,
+    totalAppointments: appointments.length,
+    physical: { earnings: physicalEarnings, count: physicalCount },
+    video: { earnings: videoEarnings, count: videoCount },
+    weeklyByWeekday: view === "weekly" ? { labels: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"], values: weeklyByWeekday } : null,
+  };
+};
+
+/**
+ * Helper to calculate admin-specific earnings
+ */
+const calculateAdminEarnings = (appointments, view) => {
+  let totalDoctorFees = 0, totalAdminEarnings = 0, physicalAdminEarning = 0, videoAdminEarning = 0;
+  const perDoctor = new Map();
+
+  for (const appt of appointments) {
+    const doc = appt.doctor;
+    if (!doc) continue;
+
+    const fee = Number(doc.fees?.amount || 0);
+    const commission = Number(appt.adminEarning || 0);
+
+    totalDoctorFees += fee;
+    totalAdminEarnings += commission;
+
+    if (appt.appointmentType === "video") videoAdminEarning += commission;
+    else physicalAdminEarning += commission;
+
+    const docId = String(doc._id);
+    if (!perDoctor.has(docId)) {
+      perDoctor.set(docId, { doctorId: docId, doctorName: doc.fullName || "", specialty: doc.specialty || "", appointments: 0, earnings: 0, adminCommission: 0 });
+    }
+    const entry = perDoctor.get(docId);
+    entry.appointments++;
+    entry.earnings += fee;
+    entry.adminCommission += commission;
+  }
+
+  const doctors = Array.from(perDoctor.values());
+  return {
+    scope: "admin",
+    view,
+    totalDoctorFees,
+    totalAdminEarnings,
+    totalAppointments: appointments.length,
+    avgPerDoctor: doctors.length > 0 ? totalDoctorFees / doctors.length : 0,
+    physicalAdminEarning,
+    videoAdminEarning,
+    doctors,
+  };
+};
+
 export const getEarningsOverview = catchAsync(async (req, res) => {
-  const role = req.user.role;
-  const userId = req.user._id;
+  const { role, _id: userId } = req.user;
   const view = (req.query.view || "monthly").toLowerCase();
 
   if (!["daily", "weekly", "monthly"].includes(view)) {
-    throw new AppError(
-      httpStatus.BAD_REQUEST,
-      "view must be one of: daily, weekly, monthly",
-    );
+    throw new AppError(httpStatus.BAD_REQUEST, "Invalid view type");
   }
 
   const { start, end } = getDateRangeForView(view);
+  const match = { status: "completed" };
+  if (start && end) match.appointmentDate = { $gte: start, $lte: end };
+  if (role === "doctor") match.doctor = userId;
 
-  const baseMatch = {
-    status: "completed",
-  };
+  const appointments = await Appointment.find(match).populate("doctor", "fullName specialty fees").lean();
+  const data = role === "doctor" ? calculateDoctorEarnings(appointments, view) : calculateAdminEarnings(appointments, view);
 
-  if (start && end) {
-    baseMatch.appointmentDate = { $gte: start, $lte: end };
-  }
-
-  if (role === "doctor") {
-    const match = { ...baseMatch, doctor: userId };
-
-    const appointments = await Appointment.find(match)
-      .populate("doctor", "fees")
-      .lean();
-
-    let totalEarnings = 0;
-    let physicalEarnings = 0;
-    let videoEarnings = 0;
-    let totalAppointments = appointments.length;
-    let physicalCount = 0;
-    let videoCount = 0;
-
-    const weeklyByWeekday = [0, 0, 0, 0, 0, 0, 0];
-
-    for (const appt of appointments) {
-      const fee = Number(appt.doctor?.fees?.amount || 0);
-      totalEarnings += fee;
-
-      if (appt.appointmentType === "physical") {
-        physicalEarnings += fee;
-        physicalCount++;
-      } else if (appt.appointmentType === "video") {
-        videoEarnings += fee;
-        videoCount++;
-      }
-
-      if (view === "weekly" && appt.appointmentDate) {
-        const d = new Date(appt.appointmentDate);
-        const idx = d.getDay();
-        weeklyByWeekday[idx] += fee;
-      }
-    }
-
-    return sendResponse(res, {
-      statusCode: httpStatus.OK,
-      success: true,
-      message: "Doctor earnings overview fetched",
-      data: {
-        scope: "doctor",
-        view,
-        totalEarnings,
-        totalAppointments,
-        physical: {
-          earnings: physicalEarnings,
-          count: physicalCount,
-        },
-        video: {
-          earnings: videoEarnings,
-          count: videoCount,
-        },
-        weeklyByWeekday:
-          view === "weekly"
-            ? {
-              labels: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
-              values: weeklyByWeekday,
-            }
-            : null,
-      },
-    });
-  }
-
-  if (role === "admin") {
-    const match = { ...baseMatch };
-
-    const appointments = await Appointment.find(match)
-      .populate("doctor", "fullName specialty fees")
-      .lean();
-
-    let totalEarning = 0; // Total doctor fees
-    let totalAdminEarning = 0; // Total admin commissions
-    let physicalAdminEarning = 0;
-    let videoAdminEarning = 0;
-    let totalAppointments = appointments.length;
-
-    const perDoctor = new Map();
-
-    for (const appt of appointments) {
-      const doc = appt.doctor;
-      if (!doc) continue;
-
-      const fee = Number(doc.fees?.amount || 0);
-      totalEarning += fee;
-
-      const commission = Number(appt.adminEarning || 0);
-      totalAdminEarning += commission;
-
-      if (appt.appointmentType === "video") {
-        videoAdminEarning += commission;
-      } else {
-        physicalAdminEarning += commission;
-      }
-
-      const docId = String(doc._id);
-      if (!perDoctor.has(docId)) {
-        perDoctor.set(docId, {
-          doctorId: docId,
-          doctorName: doc.fullName || "",
-          specialty: doc.specialty || "",
-          appointments: 0,
-          earnings: 0,
-          adminCommission: 0,
-        });
-      }
-
-      const entry = perDoctor.get(docId);
-      entry.appointments += 1;
-      entry.earnings += fee;
-      entry.adminCommission += commission;
-    }
-
-    const doctors = Array.from(perDoctor.values());
-    const avgPerDoctor =
-      doctors.length > 0 ? totalEarning / doctors.length : 0;
-
-    return sendResponse(res, {
-      statusCode: httpStatus.OK,
-      success: true,
-      message: "Admin earnings overview fetched",
-      data: {
-        scope: "admin",
-        view,
-        totalDoctorFees: totalEarning,
-        totalAdminEarnings: totalAdminEarning,
-        totalAppointments,
-        avgPerDoctor,
-        physicalAdminEarning,
-        videoAdminEarning,
-        doctors,
-      },
-    });
-  }
-
-  throw new AppError(
-    httpStatus.FORBIDDEN,
-    "Only doctor or admin can view earnings overview",
-  );
+  sendResponse(res, {
+    statusCode: httpStatus.OK,
+    success: true,
+    message: `${role} earnings overview fetched`,
+    data,
+  });
 });
+
